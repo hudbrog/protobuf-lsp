@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-package server
+package lsp
 
 import (
 	"bytes"
@@ -11,33 +11,66 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"net"
 	"os"
 	"path"
 	"strings"
 	"sync"
 
-	"github.com/hudbrog/protobuf-lsp/internal/lsp/cache"
-	"github.com/hudbrog/protobuf-lsp/internal/lsp/jsonrpc2"
-	"github.com/hudbrog/protobuf-lsp/internal/lsp/protocol"
-	"github.com/hudbrog/protobuf-lsp/internal/lsp/source"
-	"github.com/hudbrog/protobuf-lsp/internal/lsp/span"
-	"github.com/sirupsen/logrus"
 	"golang.org/x/tools/go/packages"
+	"golang.org/x/tools/internal/jsonrpc2"
+	"golang.org/x/tools/internal/lsp/cache"
+	"golang.org/x/tools/internal/lsp/protocol"
+	"golang.org/x/tools/internal/lsp/source"
+	"golang.org/x/tools/internal/lsp/xlog"
+	"golang.org/x/tools/internal/span"
 )
 
-// NewHandler starts an LSP server on the supplied stream, and waits until the
+// NewClientServer
+func NewClientServer(client protocol.Client) *Server {
+	return &Server{
+		client: client,
+		log:    xlog.New(protocol.NewLogger(client)),
+	}
+}
+
+// NewServer starts an LSP server on the supplied stream, and waits until the
 // stream is closed.
-func NewHandler(stream jsonrpc2.Stream, logger *logrus.Logger) *Handler {
-	s := &Handler{}
-	s.Conn, s.client = protocol.NewServer(stream, s, logger)
-	s.log = logger
+func NewServer(stream jsonrpc2.Stream) *Server {
+	s := &Server{}
+	s.Conn, s.client, s.log = protocol.NewServer(stream, s)
 	return s
 }
 
-type Handler struct {
+// RunServerOnPort starts an LSP server on the given port and does not exit.
+// This function exists for debugging purposes.
+func RunServerOnPort(ctx context.Context, port int, h func(s *Server)) error {
+	return RunServerOnAddress(ctx, fmt.Sprintf(":%v", port), h)
+}
+
+// RunServerOnPort starts an LSP server on the given port and does not exit.
+// This function exists for debugging purposes.
+func RunServerOnAddress(ctx context.Context, addr string, h func(s *Server)) error {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			return err
+		}
+		stream := jsonrpc2.NewHeaderStream(conn, conn)
+		s := NewServer(stream)
+		h(s)
+		go s.Run(ctx)
+	}
+}
+
+type Server struct {
 	Conn   *jsonrpc2.Conn
 	client protocol.Client
-	log    *logrus.Logger
+	log    xlog.Logger
 
 	initializedMu sync.Mutex
 	initialized   bool // set once the server has received "initialize" request
@@ -57,12 +90,11 @@ type Handler struct {
 	undelivered   map[span.URI][]source.Diagnostic
 }
 
-func (s *Handler) Run(ctx context.Context) error {
+func (s *Server) Run(ctx context.Context) error {
 	return s.Conn.Run(ctx)
 }
 
-func (s *Handler) Initialize(ctx context.Context, params *protocol.InitializeParams) (*protocol.InitializeResult, error) {
-	s.log.Debugf("Got Initialize call, URI: %s", params.RootURI)
+func (s *Server) Initialize(ctx context.Context, params *protocol.InitializeParams) (*protocol.InitializeResult, error) {
 	s.initializedMu.Lock()
 	defer s.initializedMu.Unlock()
 	if s.initialized {
@@ -118,7 +150,6 @@ func (s *Handler) Initialize(ctx context.Context, params *protocol.InitializePar
 	for _, folder := range folders {
 		uri := span.NewURI(folder.URI)
 		folderPath, err := uri.Filename()
-		s.log.Debugf("Folder path, filename: %s", folderPath)
 		if err != nil {
 			return nil, err
 		}
@@ -164,8 +195,7 @@ func (s *Handler) Initialize(ctx context.Context, params *protocol.InitializePar
 	}, nil
 }
 
-func (s *Handler) Initialized(ctx context.Context, params *protocol.InitializedParams) error {
-	s.log.Debug("Got Initialized call")
+func (s *Server) Initialized(ctx context.Context, params *protocol.InitializedParams) error {
 	if s.configurationSupported {
 		if s.dynamicConfigurationSupported {
 			s.client.RegisterCapability(ctx, &protocol.RegistrationParams{
@@ -179,18 +209,11 @@ func (s *Handler) Initialized(ctx context.Context, params *protocol.InitializedP
 			config, err := s.client.Configuration(ctx, &protocol.ConfigurationParams{
 				Items: []protocol.ConfigurationItem{{
 					ScopeURI: protocol.NewURI(view.Folder),
-					Section:  "protolsp",
+					Section:  "gopls",
 				}},
 			})
 			if err != nil {
 				return err
-			}
-			c, ok := config[0].(map[string]interface{})
-			if ok {
-				s.log.Debugf("Configuration for view: %s", view.Name)
-				for k := range c {
-					s.log.Debugf("%s", k)
-				}
 			}
 			if err := s.processConfig(view, config[0]); err != nil {
 				return err
@@ -200,7 +223,7 @@ func (s *Handler) Initialized(ctx context.Context, params *protocol.InitializedP
 	return nil
 }
 
-func (s *Handler) Shutdown(context.Context) error {
+func (s *Server) Shutdown(context.Context) error {
 	s.initializedMu.Lock()
 	defer s.initializedMu.Unlock()
 	if !s.initialized {
@@ -210,7 +233,7 @@ func (s *Handler) Shutdown(context.Context) error {
 	return nil
 }
 
-func (s *Handler) Exit(ctx context.Context) error {
+func (s *Server) Exit(ctx context.Context) error {
 	if s.initialized {
 		os.Exit(1)
 	}
@@ -218,32 +241,31 @@ func (s *Handler) Exit(ctx context.Context) error {
 	return nil
 }
 
-func (s *Handler) DidChangeWorkspaceFolders(context.Context, *protocol.DidChangeWorkspaceFoldersParams) error {
+func (s *Server) DidChangeWorkspaceFolders(context.Context, *protocol.DidChangeWorkspaceFoldersParams) error {
 	return notImplemented("DidChangeWorkspaceFolders")
 }
 
-func (s *Handler) DidChangeConfiguration(context.Context, *protocol.DidChangeConfigurationParams) error {
+func (s *Server) DidChangeConfiguration(context.Context, *protocol.DidChangeConfigurationParams) error {
 	return notImplemented("DidChangeConfiguration")
 }
 
-func (s *Handler) DidChangeWatchedFiles(context.Context, *protocol.DidChangeWatchedFilesParams) error {
+func (s *Server) DidChangeWatchedFiles(context.Context, *protocol.DidChangeWatchedFilesParams) error {
 	return notImplemented("DidChangeWatchedFiles")
 }
 
-func (s *Handler) Symbols(context.Context, *protocol.WorkspaceSymbolParams) ([]protocol.SymbolInformation, error) {
+func (s *Server) Symbols(context.Context, *protocol.WorkspaceSymbolParams) ([]protocol.SymbolInformation, error) {
 	return nil, notImplemented("Symbols")
 }
 
-func (s *Handler) ExecuteCommand(context.Context, *protocol.ExecuteCommandParams) (interface{}, error) {
+func (s *Server) ExecuteCommand(context.Context, *protocol.ExecuteCommandParams) (interface{}, error) {
 	return nil, notImplemented("ExecuteCommand")
 }
 
-func (s *Handler) DidOpen(ctx context.Context, params *protocol.DidOpenTextDocumentParams) error {
-	s.log.Debug("Got DidOpen call")
+func (s *Server) DidOpen(ctx context.Context, params *protocol.DidOpenTextDocumentParams) error {
 	return s.cacheAndDiagnose(ctx, span.NewURI(params.TextDocument.URI), params.TextDocument.Text)
 }
 
-func (s *Handler) applyChanges(ctx context.Context, params *protocol.DidChangeTextDocumentParams) (string, error) {
+func (s *Server) applyChanges(ctx context.Context, params *protocol.DidChangeTextDocumentParams) (string, error) {
 	if len(params.ContentChanges) == 1 && params.ContentChanges[0].Range == nil {
 		// If range is empty, we expect the full content of file, i.e. a single change with no range.
 		change := params.ContentChanges[0]
@@ -281,7 +303,7 @@ func (s *Handler) applyChanges(ctx context.Context, params *protocol.DidChangeTe
 	return string(content), nil
 }
 
-func (s *Handler) DidChange(ctx context.Context, params *protocol.DidChangeTextDocumentParams) error {
+func (s *Server) DidChange(ctx context.Context, params *protocol.DidChangeTextDocumentParams) error {
 	if len(params.ContentChanges) < 1 {
 		return jsonrpc2.NewErrorf(jsonrpc2.CodeInternalError, "no content changes provided")
 	}
@@ -305,25 +327,25 @@ func (s *Handler) DidChange(ctx context.Context, params *protocol.DidChangeTextD
 	return s.cacheAndDiagnose(ctx, span.NewURI(params.TextDocument.URI), text)
 }
 
-func (s *Handler) WillSave(context.Context, *protocol.WillSaveTextDocumentParams) error {
+func (s *Server) WillSave(context.Context, *protocol.WillSaveTextDocumentParams) error {
 	return notImplemented("WillSave")
 }
 
-func (s *Handler) WillSaveWaitUntil(context.Context, *protocol.WillSaveTextDocumentParams) ([]protocol.TextEdit, error) {
+func (s *Server) WillSaveWaitUntil(context.Context, *protocol.WillSaveTextDocumentParams) ([]protocol.TextEdit, error) {
 	return nil, notImplemented("WillSaveWaitUntil")
 }
 
-func (s *Handler) DidSave(context.Context, *protocol.DidSaveTextDocumentParams) error {
+func (s *Server) DidSave(context.Context, *protocol.DidSaveTextDocumentParams) error {
 	return nil // ignore
 }
 
-func (s *Handler) DidClose(ctx context.Context, params *protocol.DidCloseTextDocumentParams) error {
+func (s *Server) DidClose(ctx context.Context, params *protocol.DidCloseTextDocumentParams) error {
 	uri := span.NewURI(params.TextDocument.URI)
 	view := s.findView(ctx, uri)
 	return view.SetContent(ctx, uri, nil)
 }
 
-func (s *Handler) Completion(ctx context.Context, params *protocol.CompletionParams) (*protocol.CompletionList, error) {
+func (s *Server) Completion(ctx context.Context, params *protocol.CompletionParams) (*protocol.CompletionList, error) {
 	uri := span.NewURI(params.TextDocument.URI)
 	view := s.findView(ctx, uri)
 	f, m, err := newColumnMap(ctx, view, uri)
@@ -348,12 +370,11 @@ func (s *Handler) Completion(ctx context.Context, params *protocol.CompletionPar
 	}, nil
 }
 
-func (s *Handler) CompletionResolve(context.Context, *protocol.CompletionItem) (*protocol.CompletionItem, error) {
+func (s *Server) CompletionResolve(context.Context, *protocol.CompletionItem) (*protocol.CompletionItem, error) {
 	return nil, notImplemented("CompletionResolve")
 }
 
-func (s *Handler) Hover(ctx context.Context, params *protocol.TextDocumentPositionParams) (*protocol.Hover, error) {
-	s.log.Debug("Got Hover call")
+func (s *Server) Hover(ctx context.Context, params *protocol.TextDocumentPositionParams) (*protocol.Hover, error) {
 	uri := span.NewURI(params.TextDocument.URI)
 	view := s.findView(ctx, uri)
 	f, m, err := newColumnMap(ctx, view, uri)
@@ -394,7 +415,7 @@ func (s *Handler) Hover(ctx context.Context, params *protocol.TextDocumentPositi
 	}, nil
 }
 
-func (s *Handler) SignatureHelp(ctx context.Context, params *protocol.TextDocumentPositionParams) (*protocol.SignatureHelp, error) {
+func (s *Server) SignatureHelp(ctx context.Context, params *protocol.TextDocumentPositionParams) (*protocol.SignatureHelp, error) {
 	uri := span.NewURI(params.TextDocument.URI)
 	view := s.findView(ctx, uri)
 	f, m, err := newColumnMap(ctx, view, uri)
@@ -416,7 +437,7 @@ func (s *Handler) SignatureHelp(ctx context.Context, params *protocol.TextDocume
 	return toProtocolSignatureHelp(info), nil
 }
 
-func (s *Handler) Definition(ctx context.Context, params *protocol.TextDocumentPositionParams) ([]protocol.Location, error) {
+func (s *Server) Definition(ctx context.Context, params *protocol.TextDocumentPositionParams) ([]protocol.Location, error) {
 	uri := span.NewURI(params.TextDocument.URI)
 	view := s.findView(ctx, uri)
 	f, m, err := newColumnMap(ctx, view, uri)
@@ -450,7 +471,7 @@ func (s *Handler) Definition(ctx context.Context, params *protocol.TextDocumentP
 	return []protocol.Location{loc}, nil
 }
 
-func (s *Handler) TypeDefinition(ctx context.Context, params *protocol.TextDocumentPositionParams) ([]protocol.Location, error) {
+func (s *Server) TypeDefinition(ctx context.Context, params *protocol.TextDocumentPositionParams) ([]protocol.Location, error) {
 	uri := span.NewURI(params.TextDocument.URI)
 	view := s.findView(ctx, uri)
 	f, m, err := newColumnMap(ctx, view, uri)
@@ -484,15 +505,15 @@ func (s *Handler) TypeDefinition(ctx context.Context, params *protocol.TextDocum
 	return []protocol.Location{loc}, nil
 }
 
-func (s *Handler) Implementation(context.Context, *protocol.TextDocumentPositionParams) ([]protocol.Location, error) {
+func (s *Server) Implementation(context.Context, *protocol.TextDocumentPositionParams) ([]protocol.Location, error) {
 	return nil, notImplemented("Implementation")
 }
 
-func (s *Handler) References(context.Context, *protocol.ReferenceParams) ([]protocol.Location, error) {
+func (s *Server) References(context.Context, *protocol.ReferenceParams) ([]protocol.Location, error) {
 	return nil, notImplemented("References")
 }
 
-func (s *Handler) DocumentHighlight(ctx context.Context, params *protocol.TextDocumentPositionParams) ([]protocol.DocumentHighlight, error) {
+func (s *Server) DocumentHighlight(ctx context.Context, params *protocol.TextDocumentPositionParams) ([]protocol.DocumentHighlight, error) {
 	uri := span.NewURI(params.TextDocument.URI)
 	view := s.findView(ctx, uri)
 	f, m, err := newColumnMap(ctx, view, uri)
@@ -514,7 +535,7 @@ func (s *Handler) DocumentHighlight(ctx context.Context, params *protocol.TextDo
 	return toProtocolHighlight(m, spans), nil
 }
 
-func (s *Handler) DocumentSymbol(ctx context.Context, params *protocol.DocumentSymbolParams) ([]protocol.DocumentSymbol, error) {
+func (s *Server) DocumentSymbol(ctx context.Context, params *protocol.DocumentSymbolParams) ([]protocol.DocumentSymbol, error) {
 	uri := span.NewURI(params.TextDocument.URI)
 	view := s.findView(ctx, uri)
 	f, m, err := newColumnMap(ctx, view, uri)
@@ -525,7 +546,7 @@ func (s *Handler) DocumentSymbol(ctx context.Context, params *protocol.DocumentS
 	return toProtocolDocumentSymbols(m, symbols), nil
 }
 
-func (s *Handler) CodeAction(ctx context.Context, params *protocol.CodeActionParams) ([]protocol.CodeAction, error) {
+func (s *Server) CodeAction(ctx context.Context, params *protocol.CodeActionParams) ([]protocol.CodeAction, error) {
 	uri := span.NewURI(params.TextDocument.URI)
 	view := s.findView(ctx, uri)
 	_, m, err := newColumnMap(ctx, view, uri)
@@ -553,38 +574,38 @@ func (s *Handler) CodeAction(ctx context.Context, params *protocol.CodeActionPar
 	}, nil
 }
 
-func (s *Handler) CodeLens(context.Context, *protocol.CodeLensParams) ([]protocol.CodeLens, error) {
+func (s *Server) CodeLens(context.Context, *protocol.CodeLensParams) ([]protocol.CodeLens, error) {
 	return nil, nil // ignore
 }
 
-func (s *Handler) CodeLensResolve(context.Context, *protocol.CodeLens) (*protocol.CodeLens, error) {
+func (s *Server) CodeLensResolve(context.Context, *protocol.CodeLens) (*protocol.CodeLens, error) {
 	return nil, notImplemented("CodeLensResolve")
 }
 
-func (s *Handler) DocumentLink(context.Context, *protocol.DocumentLinkParams) ([]protocol.DocumentLink, error) {
+func (s *Server) DocumentLink(context.Context, *protocol.DocumentLinkParams) ([]protocol.DocumentLink, error) {
 	return nil, nil // ignore
 }
 
-func (s *Handler) DocumentLinkResolve(context.Context, *protocol.DocumentLink) (*protocol.DocumentLink, error) {
+func (s *Server) DocumentLinkResolve(context.Context, *protocol.DocumentLink) (*protocol.DocumentLink, error) {
 	return nil, notImplemented("DocumentLinkResolve")
 }
 
-func (s *Handler) DocumentColor(context.Context, *protocol.DocumentColorParams) ([]protocol.ColorInformation, error) {
+func (s *Server) DocumentColor(context.Context, *protocol.DocumentColorParams) ([]protocol.ColorInformation, error) {
 	return nil, notImplemented("DocumentColor")
 }
 
-func (s *Handler) ColorPresentation(context.Context, *protocol.ColorPresentationParams) ([]protocol.ColorPresentation, error) {
+func (s *Server) ColorPresentation(context.Context, *protocol.ColorPresentationParams) ([]protocol.ColorPresentation, error) {
 	return nil, notImplemented("ColorPresentation")
 }
 
-func (s *Handler) Formatting(ctx context.Context, params *protocol.DocumentFormattingParams) ([]protocol.TextEdit, error) {
+func (s *Server) Formatting(ctx context.Context, params *protocol.DocumentFormattingParams) ([]protocol.TextEdit, error) {
 	uri := span.NewURI(params.TextDocument.URI)
 	view := s.findView(ctx, uri)
 	spn := span.New(uri, span.Point{}, span.Point{})
 	return formatRange(ctx, view, spn)
 }
 
-func (s *Handler) RangeFormatting(ctx context.Context, params *protocol.DocumentRangeFormattingParams) ([]protocol.TextEdit, error) {
+func (s *Server) RangeFormatting(ctx context.Context, params *protocol.DocumentRangeFormattingParams) ([]protocol.TextEdit, error) {
 	uri := span.NewURI(params.TextDocument.URI)
 	view := s.findView(ctx, uri)
 	_, m, err := newColumnMap(ctx, view, uri)
@@ -598,19 +619,19 @@ func (s *Handler) RangeFormatting(ctx context.Context, params *protocol.Document
 	return formatRange(ctx, view, spn)
 }
 
-func (s *Handler) OnTypeFormatting(context.Context, *protocol.DocumentOnTypeFormattingParams) ([]protocol.TextEdit, error) {
+func (s *Server) OnTypeFormatting(context.Context, *protocol.DocumentOnTypeFormattingParams) ([]protocol.TextEdit, error) {
 	return nil, notImplemented("OnTypeFormatting")
 }
 
-func (s *Handler) Rename(context.Context, *protocol.RenameParams) ([]protocol.WorkspaceEdit, error) {
+func (s *Server) Rename(context.Context, *protocol.RenameParams) ([]protocol.WorkspaceEdit, error) {
 	return nil, notImplemented("Rename")
 }
 
-func (s *Handler) FoldingRanges(context.Context, *protocol.FoldingRangeParams) ([]protocol.FoldingRange, error) {
+func (s *Server) FoldingRanges(context.Context, *protocol.FoldingRangeParams) ([]protocol.FoldingRange, error) {
 	return nil, notImplemented("FoldingRanges")
 }
 
-func (s *Handler) processConfig(view *cache.View, config interface{}) error {
+func (s *Server) processConfig(view *cache.View, config interface{}) error {
 	// TODO: We should probably store and process more of the config.
 	if config == nil {
 		return nil // ignore error if you don't have a config
@@ -649,7 +670,7 @@ func notImplemented(method string) *jsonrpc2.Error {
 	return jsonrpc2.NewErrorf(jsonrpc2.CodeMethodNotFound, "method %q not yet implemented", method)
 }
 
-func (s *Handler) findView(ctx context.Context, uri span.URI) *cache.View {
+func (s *Server) findView(ctx context.Context, uri span.URI) *cache.View {
 	// first see if a view already has this file
 	for _, view := range s.views {
 		if view.FindFile(ctx, uri) != nil {

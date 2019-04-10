@@ -8,9 +8,14 @@ import (
 )
 
 func main() {
-	logrus.SetFormatter(&logrus.TextFormatter{})
-	logrus.SetLevel(logrus.DebugLevel)
-	logrus.SetOutput(os.Stdout)
+	MyLogger := new(logrus.Logger)
+	MyLogger.SetFormatter(&logrus.TextFormatter{})
+	MyLogger.SetLevel(logrus.DebugLevel)
+	f, err := os.OpenFile("filename.log", os.O_WRONLY|os.O_CREATE, 0755)
+	if err != nil {
+		return
+	}
+	MyLogger.SetOutput(f)
 
-	cmd.Execute()
+	cmd.Execute(MyLogger)
 }
